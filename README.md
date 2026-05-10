@@ -64,9 +64,9 @@ Download `movies_metadata.csv` from Kaggle:
 Place it in the **root directory** of the project:
 
 ```
-movie-prediction-pipeline/
+Datascience/
 ├── movies_metadata.csv   ← place here
-├── main.py
+├── task.py
 ├── requirements.txt
 └── ...
 ```
