@@ -59,7 +59,7 @@ selenium
 
 Download `movies_metadata.csv` from Kaggle:
 
-👉 [TMDB Movie Metadata – Kaggle](https://www.kaggle.com/datasets/rounakbanik/the-movies-dataset)
+ [TMDB Movie Metadata – Kaggle](https://www.kaggle.com/datasets/rounakbanik/the-movies-dataset)
 
 Place it in the **root directory** of the project:
 
@@ -238,7 +238,7 @@ The script will:
 
 ---
 
-## 📦 Output Files
+##  Output Files
 
 | File | Description |
 |------|-------------|
@@ -248,7 +248,7 @@ The script will:
 
 ---
 
-## 🚀 API Usage (FastAPI)
+##  API Usage (FastAPI)
 
 ### Start the server
 
@@ -286,7 +286,7 @@ POST http://127.0.0.1:8000/predict
 
 ---
 
-## 🌐 Web Scraping
+##  Web Scraping
 
 ```bash
 python scraper.py
@@ -296,7 +296,7 @@ Scrapes movie data using **Requests** + **BeautifulSoup** and exports it as `scr
 
 ---
 
-## 🤖 Browser Automation (Selenium)
+##  Browser Automation (Selenium)
 
 ```bash
 python selenium_automation.py
@@ -308,7 +308,7 @@ Automates browser tasks such as login and data extraction using **Selenium WebDr
 
 ---
 
-## 📊 Results
+##  Results
 
 After running `main.py`, the best model is printed:
 
@@ -321,7 +321,7 @@ Full comparison is saved to `robust_results.csv`.
 ---
 
 
-## 🙌 Acknowledgements
+##  Acknowledgements
 
 - Dataset: [TMDB Movies Metadata on Kaggle](https://www.kaggle.com/datasets/rounakbanik/the-movies-dataset)
 - Libraries: scikit-learn, pandas, seaborn, FastAPI, Selenium
