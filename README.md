@@ -320,11 +320,6 @@ Full comparison is saved to `robust_results.csv`.
 
 ---
 
-## 📄 License
-
-This project is licensed under the MIT License.
-
----
 
 ## 🙌 Acknowledgements
 
