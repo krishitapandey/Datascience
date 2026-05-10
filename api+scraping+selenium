@@ -1,0 +1,564 @@
+
+
+def run(cmd):
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    if result.returncode != 0 and result.stderr:
+        print(f"[WARN] {cmd[:60]}...\n{result.stderr[:200]}")
+    return result
+
+print(" Installing Python packages...")
+run("pip install -q pyngrok fastapi nest-asyncio scikit-learn pandas numpy "
+    "matplotlib seaborn joblib uvicorn requests beautifulsoup4 selenium webdriver-manager")
+
+print(" Installing Google Chrome (fixes Selenium crash)...")
+run("apt-get update -qq")
+run("wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb")
+run("apt-get install -y -q ./google-chrome-stable_current_amd64.deb")
+
+print(" All dependencies installed\n")
+
+import nest_asyncio
+nest_asyncio.apply()
+
+import os, time, json, warnings, threading
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import joblib
+import requests
+from bs4 import BeautifulSoup
+
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+from sklearn.ensemble import RandomForestClassifier
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+
+from pyngrok import ngrok
+
+warnings.filterwarnings("ignore")
+plt.style.use("seaborn-v0_8")
+sns.set_palette("husl")
+
+#   SET YOUR FREE NGROK TOKEN HERE  →  https://dashboard.ngrok.com/get-started/your-authtoken
+NGROK_AUTH_TOKEN = "PASTE_YOUR_TOKEN_HERE"
+
+
+print(" MOVIE ML PIPELINE  —  K-Means · FastAPI · Scraping · Selenium")
+print("=" * 70)
+
+
+print("\n Loading data...")
+
+KEY_COLS = ["budget", "revenue", "runtime", "vote_average",
+            "vote_count", "popularity", "release_date", "title"]
+
+try:
+    df = pd.read_csv("movies_metadata.csv", low_memory=False)
+    df = df[KEY_COLS].copy()
+    print(" movies_metadata.csv loaded")
+except FileNotFoundError:
+    print("  movies_metadata.csv not found — generating synthetic data")
+    np.random.seed(42)
+    N = 2000
+    df = pd.DataFrame({
+        "budget":       np.random.randint(500_000,   300_000_000, N).astype(float),
+        "revenue":      np.random.randint(1_000_000, 2_000_000_000, N).astype(float),
+        "runtime":      np.random.randint(75, 210, N).astype(float),
+        "vote_average": np.random.uniform(3.5, 9.0, N),
+        "vote_count":   np.random.randint(50, 150_000, N).astype(float),
+        "popularity":   np.random.uniform(0.5, 200, N),
+        "release_date": pd.date_range("1980-01-01", periods=N, freq="10D"),
+        "title":        [f"Movie_{i:04d}" for i in range(N)],
+    })
+
+# Clean numerics
+for col in ["budget", "revenue", "runtime", "vote_average", "vote_count", "popularity"]:
+    df[col] = pd.to_numeric(df[col], errors="coerce")
+
+df["release_date"] = pd.to_datetime(df["release_date"], errors="coerce")
+df = df.dropna(subset=["release_date"]).reset_index(drop=True)
+print(f"   Shape after cleaning: {df.shape}")
+
+# ── STEP 3: Web scraping — IMDB Top 50 ───────────────────────────────────────
+print("\n🕷️  Scraping IMDB Top 250...")
+
+def scrape_imdb() -> pd.DataFrame:
+    url     = "https://www.imdb.com/chart/top/"
+    headers = {"User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )}
+    try:
+        resp = requests.get(url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        soup  = BeautifulSoup(resp.content, "html.parser")
+        items = soup.find_all("li", class_="ipc-metadata-list-summary-item")
+        movies = []
+        for item in items[:50]:
+            try:
+                # ── fixed title extraction ──
+                title_el = item.find("h3", class_="ipc-title__text")
+                raw      = title_el.text.strip() if title_el else ""
+                # Strip leading "1. " rank prefix
+                title = ". ".join(raw.split(". ")[1:]) if ". " in raw else raw
+
+                # rank
+                rank_str = raw.split(".")[0]
+                rank     = int(rank_str) if rank_str.isdigit() else 0
+
+                # year
+                year_el = item.find("span", {"data-testid": "title-year"})
+                if year_el:
+                    year_text = year_el.text.strip().strip("()")
+                    year = int(year_text[:4]) if year_text[:4].isdigit() else 2020
+                else:
+                    year = 2020
+
+                # rating
+                rating_el = item.find("span", class_="ipc-rating-star--rating")
+                rating = float(rating_el.text.strip()) if rating_el else None
+
+                movies.append({
+                    "title":        title,
+                    "imdb_rank":    rank,
+                    "release_year": year,
+                    "imdb_rating":  rating,
+                    "source":       "imdb_scrape",
+                })
+            except Exception:
+                continue
+
+        result = pd.DataFrame(movies)
+        result.to_csv("imdb_top_movies.csv", index=False)
+        print(f"    Scraped {len(result)} IMDB movies → imdb_top_movies.csv")
+        return result
+
+    except Exception as exc:
+        print(f"     IMDB scrape failed: {exc}")
+        return pd.DataFrame()
+
+df_imdb = scrape_imdb()
+
+# ── STEP 4: Selenium — Rotten Tomatoes ───────────────────────────────────────
+print("\n Selenium: Rotten Tomatoes in-theaters...")
+
+def scrape_rt_selenium() -> pd.DataFrame:
+    opts = Options()
+    # ── fixes for Colab/headless environments ──
+    opts.binary_location = "/usr/bin/google-chrome"   
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--disable-extensions")
+    opts.add_argument("--window-size=1920,1080")
+    opts.add_argument("--remote-debugging-port=9222")
+    opts.add_argument(
+        "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    )
+
+    try:
+        service = Service(ChromeDriverManager().install())
+        driver  = webdriver.Chrome(service=service, options=opts)
+        driver.set_page_load_timeout(30)
+
+        driver.get("https://www.rottentomatoes.com/browse/movies_in_theaters/")
+        time.sleep(4)   
+
+        rt_movies = []
+        cards = driver.find_elements(By.CSS_SELECTOR, "[data-testid='tile']")
+        print(f"   Found {len(cards)} movie cards")
+
+        for card in cards[:25]:
+            try:
+                title = card.find_element(
+                    By.CSS_SELECTOR, "[data-testid='tile-title']"
+                ).text.strip()
+            except Exception:
+                try:
+                    title = card.find_element(By.TAG_NAME, "p").text.strip()
+                except Exception:
+                    title = "Unknown"
+
+            try:
+                score = card.find_element(
+                    By.CSS_SELECTOR, "rt-text[slot='criticsScore']"
+                ).text.strip()
+            except Exception:
+                score = None
+
+            rt_movies.append({
+                "title":    title,
+                "rt_score": score,
+                "source":   "rt_selenium",
+            })
+
+        driver.quit()
+        result = pd.DataFrame(rt_movies)
+        result.to_csv("rotten_tomatoes_movies.csv", index=False)
+        print(f"    Scraped {len(result)} RT movies → rotten_tomatoes_movies.csv")
+        return result
+
+    except Exception as exc:
+        print(f"    Selenium failed: {exc}")
+        return pd.DataFrame()
+
+df_rt = scrape_rt_selenium()
+
+# ── STEP 5: Feature engineering ──────────────────────────────────────────────
+print("\n  Engineering features...")
+
+df_feat = df.copy()
+df_feat["release_year"] = df_feat["release_date"].dt.year.fillna(2000).astype(int)
+df_feat["profit"]       = df_feat["revenue"].fillna(0) - df_feat["budget"].fillna(0)
+df_feat["roi"]          = np.where(
+    df_feat["budget"].fillna(0) > 0,
+    df_feat["revenue"].fillna(0) / df_feat["budget"].fillna(0),
+    1.0,
+)
+df_feat["log_budget"]  = np.log1p(df_feat["budget"].fillna(0))
+df_feat["log_revenue"] = np.log1p(df_feat["revenue"].fillna(0))
+
+# Merge scraped data where titles match
+if not df_imdb.empty:
+    df_feat = df_feat.merge(
+        df_imdb[["title", "imdb_rank", "imdb_rating"]],
+        on="title", how="left"
+    )
+if not df_rt.empty:
+    df_feat = df_feat.merge(
+        df_rt[["title", "rt_score"]],
+        on="title", how="left"
+    )
+
+print(f"   Final feature shape: {df_feat.shape}")
+
+# ── STEP 6: K-Means clustering ────────────────────────────────────────────────
+print("\n K-Means Clustering...")
+
+CLUSTER_FEATURES = [
+    "log_budget", "log_revenue", "runtime",
+    "popularity", "vote_average", "vote_count",
+    "profit", "roi", "release_year",
+]
+
+X_raw        = df_feat[CLUSTER_FEATURES].fillna(df_feat[CLUSTER_FEATURES].median())
+cluster_scaler = StandardScaler()
+X_scaled     = cluster_scaler.fit_transform(X_raw)
+
+# Elbow method
+inertias = []
+K_RANGE  = range(1, 11)
+for k in K_RANGE:
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    km.fit(X_scaled)
+    inertias.append(km.inertia_)
+
+OPTIMAL_K = 4
+kmeans    = KMeans(n_clusters=OPTIMAL_K, random_state=42, n_init=10)
+df_feat["cluster"] = kmeans.fit_predict(X_scaled)
+
+# PCA for 2-D visualisation
+pca   = PCA(n_components=2, random_state=42)
+X_pca = pca.fit_transform(X_scaled)
+
+# ── Plot ──────────────────────────────────────────────────────────────────────
+fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+fig.suptitle("Movie Clustering Analysis", fontsize=16, fontweight="bold")
+
+# Elbow
+axes[0].plot(list(K_RANGE), inertias, "bo-", linewidth=2, markersize=6)
+axes[0].axvline(x=OPTIMAL_K, color="red", linestyle="--", alpha=0.7, label=f"k={OPTIMAL_K}")
+axes[0].set(xlabel="Number of Clusters (k)", ylabel="Inertia", title="Elbow Method")
+axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+# PCA scatter
+sc = axes[1].scatter(X_pca[:, 0], X_pca[:, 1],
+                     c=df_feat["cluster"], cmap="viridis", alpha=0.5, s=10)
+plt.colorbar(sc, ax=axes[1])
+axes[1].set(xlabel=f"PC1 ({pca.explained_variance_ratio_[0]:.1%})",
+            ylabel=f"PC2 ({pca.explained_variance_ratio_[1]:.1%})",
+            title=f"Clusters (k={OPTIMAL_K})")
+
+# Distribution
+counts = df_feat["cluster"].value_counts().sort_index()
+bars   = axes[2].bar(counts.index.astype(str), counts.values,
+                     color=plt.cm.viridis(np.linspace(0, 1, OPTIMAL_K)))
+for bar, val in zip(bars, counts.values):
+    axes[2].text(bar.get_x() + bar.get_width()/2, bar.get_height() + 50,
+                 str(val), ha="center", va="bottom", fontweight="bold")
+axes[2].set(xlabel="Cluster", ylabel="Count", title="Cluster Distribution")
+
+plt.tight_layout()
+plt.savefig("movie_clusters.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print(f"    Created {OPTIMAL_K} clusters")
+print(df_feat["cluster"].value_counts().sort_index().to_string())
+
+# ── STEP 7: Cluster profiling ─────────────────────────────────────────────────
+CLUSTER_LABELS = {
+    0: "Mainstream Crowd-Pleasers",
+    1: "Prestige / Award Films",
+    2: "Low-Budget Indies",
+    3: "Blockbuster Mega-Hits",
+}
+profile_cols  = ["vote_average", "revenue", "budget", "popularity", "runtime"]
+cluster_stats = df_feat.groupby("cluster")[profile_cols].mean().round(2)
+print("\n Cluster Profiles:")
+print(cluster_stats.to_string())
+
+# ── STEP 8: Quality classifier ────────────────────────────────────────────────
+print("\n Training quality classifier (vote_avg ≥ 7.0 = high quality)...")
+
+CLASSIF_FEATURES = [
+    "log_budget", "log_revenue", "runtime", "vote_count",
+    "popularity", "profit", "roi", "release_year",
+]
+X_clf = df_feat[CLASSIF_FEATURES].fillna(df_feat[CLASSIF_FEATURES].median())
+y_clf = (df_feat["vote_average"].fillna(5) >= 7.0).astype(int)
+
+clf_scaler = StandardScaler()
+X_clf_sc   = clf_scaler.fit_transform(X_clf)
+
+classifier = RandomForestClassifier(
+    n_estimators=150, max_depth=10,
+    random_state=42, n_jobs=-1
+)
+classifier.fit(X_clf_sc, y_clf)
+
+train_acc = classifier.score(X_clf_sc, y_clf)
+print(f"    Classifier trained  |  Training accuracy: {train_acc:.2%}")
+
+# Feature importance plot
+feat_imp = pd.Series(classifier.feature_importances_, index=CLASSIF_FEATURES).sort_values()
+fig, ax  = plt.subplots(figsize=(9, 4))
+feat_imp.plot(kind="barh", ax=ax, color="steelblue")
+ax.set(title="Feature Importance — Quality Classifier", xlabel="Importance")
+plt.tight_layout()
+plt.savefig("feature_importance.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+# ── STEP 9: Save everything ───────────────────────────────────────────────────
+print("\n Saving models and data...")
+
+PIPELINES = {
+    "cluster": {
+        "kmeans":   kmeans,
+        "scaler":   cluster_scaler,
+        "pca":      pca,
+        "features": CLUSTER_FEATURES,
+        "labels":   CLUSTER_LABELS,
+    },
+    "classify": {
+        "model":    classifier,
+        "scaler":   clf_scaler,
+        "features": CLASSIF_FEATURES,
+    },
+    "data":    df_feat,
+    "profile": cluster_stats,
+}
+
+joblib.dump(PIPELINES, "movie_pipelines.pkl")
+df_feat.to_csv("movie_features_final.csv", index=False)
+print("    movie_pipelines.pkl  +  movie_features_final.csv")
+
+# ── STEP 10: FastAPI application ──────────────────────────────────────────────
+app = FastAPI(
+    title="🎬 Movie ML API",
+    description="K-Means clustering + quality classifier for movies",
+    version="2.0.0",
+)
+
+# ── Request / Response models ──────────────────────────────────────────────────
+class MovieInput(BaseModel):
+    budget:       float = 50_000_000
+    revenue:      float = 200_000_000
+    runtime:      float = 120.0
+    vote_average: float = 6.5
+    vote_count:   float = 5_000.0
+    popularity:   float = 50.0
+    release_year: float = 2023.0
+
+class ClusterResponse(BaseModel):
+    cluster:       int
+    cluster_name:  str
+    confidence:    float
+    similar_movies: list
+
+class QualityResponse(BaseModel):
+    is_quality_movie: bool
+    probability:      float
+    confidence:       float
+
+class ScrapeResponse(BaseModel):
+    source:  str
+    records: int
+    data:    list
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def _prep_cluster(movie: MovieInput) -> np.ndarray:
+    d = movie.dict()
+    d["log_budget"]  = np.log1p(d["budget"])
+    d["log_revenue"] = np.log1p(d["revenue"])
+    d["profit"]      = d["revenue"] - d["budget"]
+    d["roi"]         = d["revenue"] / d["budget"] if d["budget"] > 0 else 1.0
+    row = pd.DataFrame([d])[PIPELINES["cluster"]["features"]].fillna(0)
+    return PIPELINES["cluster"]["scaler"].transform(row)
+
+def _prep_classify(movie: MovieInput) -> np.ndarray:
+    d = movie.dict()
+    d["log_budget"]  = np.log1p(d["budget"])
+    d["log_revenue"] = np.log1p(d["revenue"])
+    d["profit"]      = d["revenue"] - d["budget"]
+    d["roi"]         = d["revenue"] / d["budget"] if d["budget"] > 0 else 1.0
+    row = pd.DataFrame([d])[PIPELINES["classify"]["features"]].fillna(0)
+    return PIPELINES["classify"]["scaler"].transform(row)
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+@app.get("/", tags=["Info"])
+async def root():
+    return {
+        "status":    "🎬 Movie ML API is LIVE!",
+        "endpoints": [
+            "/docs",
+            "/predict-cluster",
+            "/predict-quality",
+            "/cluster-stats",
+            "/scrape-imdb",
+            "/scrape-rt",
+        ],
+    }
+
+@app.post("/predict-cluster", response_model=ClusterResponse, tags=["ML"])
+async def predict_cluster(movie: MovieInput):
+    """Predict which cluster a movie belongs to."""
+    try:
+        X    = _prep_cluster(movie)
+        clus = int(PIPELINES["cluster"]["kmeans"].predict(X)[0])
+        dist = PIPELINES["cluster"]["kmeans"].transform(X)[0]
+        conf = float(1 / (1 + dist.min()))
+        similar = (
+            PIPELINES["data"]
+            .query("cluster == @clus")["title"]
+            .dropna().head(5).tolist()
+        )
+        return ClusterResponse(
+            cluster=clus,
+            cluster_name=PIPELINES["cluster"]["labels"].get(clus, "Unknown"),
+            confidence=round(conf, 4),
+            similar_movies=similar,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.post("/predict-quality", response_model=QualityResponse, tags=["ML"])
+async def predict_quality(movie: MovieInput):
+    """Predict whether a movie will be high quality (vote_avg ≥ 7.0)."""
+    try:
+        X    = _prep_classify(movie)
+        prob = PIPELINES["classify"]["model"].predict_proba(X)[0]
+        pred = int(PIPELINES["classify"]["model"].predict(X)[0])
+        return QualityResponse(
+            is_quality_movie=bool(pred),
+            probability=round(float(prob[1]), 4),
+            confidence=round(float(prob.max()), 4),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+@app.get("/cluster-stats", tags=["Analytics"])
+async def cluster_stats():
+    """Mean feature values for each cluster."""
+    stats = PIPELINES["profile"].reset_index().to_dict(orient="records")
+    labels = {k: v for k, v in PIPELINES["cluster"]["labels"].items()}
+    return {"cluster_labels": labels, "stats": stats}
+
+@app.get("/scrape-imdb", tags=["Scraping"])
+async def live_scrape_imdb():
+    """Live-scrape IMDB Top 250 and return top 20."""
+    result = scrape_imdb()
+    return ScrapeResponse(
+        source="imdb.com/chart/top",
+        records=len(result),
+        data=result.head(20).to_dict(orient="records") if not result.empty else [],
+    )
+
+@app.get("/scrape-rt", tags=["Scraping"])
+async def live_scrape_rt():
+    """Live-scrape Rotten Tomatoes in-theaters via Selenium."""
+    result = scrape_rt_selenium()
+    return ScrapeResponse(
+        source="rottentomatoes.com/browse/movies_in_theaters",
+        records=len(result),
+        data=result.to_dict(orient="records") if not result.empty else [],
+    )
+
+# ── STEP 11: Kill any process on port 8000, then start server ────────────────
+print("\n🚀 Starting FastAPI server on port 8000...")
+os.system("fuser -k 8000/tcp 2>/dev/null")
+time.sleep(2)
+
+def run_server():
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")
+
+server_thread = threading.Thread(target=run_server, daemon=True)
+server_thread.start()
+time.sleep(3)   # let uvicorn fully start
+
+# ── STEP 12: ngrok public tunnel ─────────────────────────────────────────────
+print(" Creating public ngrok tunnel...")
+
+if NGROK_AUTH_TOKEN == "PASTE_YOUR_TOKEN_HERE":
+    print("  NGROK_AUTH_TOKEN not set — skipping tunnel.")
+    print("   Get a free token: https://dashboard.ngrok.com/get-started/your-authtoken")
+    print("   Set NGROK_AUTH_TOKEN at the top of this script, then re-run.")
+    PUBLIC_URL = "http://localhost:8000  (local only — no ngrok token)"
+else:
+    ngrok.set_auth_token(NGROK_AUTH_TOKEN)
+    tunnel     = ngrok.connect(8000)
+    PUBLIC_URL = tunnel.public_url
+    print(f"\n{'='*70}")
+    print(f"  PUBLIC API URL : {PUBLIC_URL}")
+    print(f" Swagger docs  : {PUBLIC_URL}/docs")
+    print(f"  Cluster stats : {PUBLIC_URL}/cluster-stats")
+    print(f"{'='*70}\n")
+
+# ── STEP 13: Quick smoke-test ─────────────────────────────────────────────────
+print(" Smoke-testing /predict-cluster ...")
+try:
+    payload = {
+        "budget": 80_000_000, "revenue": 350_000_000,
+        "runtime": 130, "vote_average": 7.2,
+        "vote_count": 12000, "popularity": 80, "release_year": 2024,
+    }
+    resp = requests.post("http://localhost:8000/predict-cluster", json=payload, timeout=10)
+    data = resp.json()
+    print(f"   Cluster: {data['cluster']} — {data['cluster_name']}")
+    print(f"   Confidence: {data['confidence']}")
+    print(f"   Similar movies: {data['similar_movies'][:3]}")
+
+    resp2 = requests.post("http://localhost:8000/predict-quality", json=payload, timeout=10)
+    data2 = resp2.json()
+    print(f"\n   Quality prediction: {' High' if data2['is_quality_movie'] else ' Low'}")
+    print(f"   Probability of high quality: {data2['probability']:.2%}")
+except Exception as exc:
+    print(f"     Smoke test failed: {exc}")
+
+print("\n Pipeline complete!")
+print(f"   API running at: {PUBLIC_URL}")
+print("   Press Ctrl+C to stop the server.")
