@@ -35,7 +35,7 @@ plt.style.use("ggplot")
 nest_asyncio.apply()
 
 # --- SET YOUR NGROK TOKEN HERE ---
-NGROK_AUTH_TOKEN = "PASTE_YOUR_TOKEN_HERE"
+NGROK_AUTH_TOKEN = "NGROK_AUTH"
 
 # 1. SETUP & DATA LOADING
 print("--- Loading and Cleaning Data ---")
